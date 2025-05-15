@@ -1,3 +1,4 @@
+from bson import ObjectId
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pymongo import MongoClient
@@ -62,6 +63,7 @@ class UserInDB(User):
 
 
 class Candidate(BaseModel):
+    _id: Optional[str] = None
     name: str
     position: str
     image_url: Optional[str] = None
@@ -82,7 +84,6 @@ class Token(BaseModel):
     token_type: str
 
 
-# Utility Functions
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -111,6 +112,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     user = users_collection.find_one({"username": username})
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+    user["_id"] = str(user["_id"])  # Convert ObjectId to string
     return user
 
 
@@ -147,6 +149,14 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+@app.get("/users/me", response_model=User)
+async def get_current_user_details(current_user: dict = Depends(get_current_user)):
+    return {
+        "username": current_user["username"],
+        "email": current_user["email"],
+        "is_admin": current_user["is_admin"]
+    }
+
 @app.post("/positions")
 async def create_position(position: Position, current_user: dict = Depends(get_current_admin)):
     if positions_collection.find_one({"name": position.name}):
@@ -170,8 +180,8 @@ async def create_candidate(name: str, position: str, image: UploadFile = File(..
         "position": position,
         "image_url": image_url
     }
-    candidates_collection.insert_one(candidate)
-    return {"msg": "Candidate created successfully"}
+    result = candidates_collection.insert_one(candidate)
+    return {"msg": "Candidate created successfully", "candidate_id": str(result.inserted_id)}
 
 
 @app.get("/positions", response_model=List[Position])
@@ -179,16 +189,25 @@ async def get_positions():
     positions = list(positions_collection.find({}, {"_id": 0}))
     return positions
 
-
 @app.get("/candidates", response_model=List[Candidate])
 async def get_candidates():
-    candidates = list(candidates_collection.find({}, {"_id": 0}))
-    return candidates
+    candidates = list(candidates_collection.find())
+    # Convert ObjectId to string and format response
+    return [
+        {
+            "_id": str(candidate["_id"]),
+            "name": candidate["name"],
+            "position": candidate["position"],
+            "image_url": candidate.get("image_url")
+        }
+        for candidate in candidates
+    ]
 
 
 @app.post("/vote")
 async def vote(candidate_id: str, position: str, current_user: dict = Depends(get_current_user)):
-    if not candidates_collection.find_one({"_id": candidate_id, "position": position}):
+    # Validate candidate_id and position
+    if not candidates_collection.find_one({"_id": ObjectId(candidate_id), "position": position}):
         raise HTTPException(status_code=400, detail="Invalid candidate or position")
 
     if votes_collection.find_one({"user_id": str(current_user["_id"]), "position": position}):
@@ -203,7 +222,6 @@ async def vote(candidate_id: str, position: str, current_user: dict = Depends(ge
     votes_collection.insert_one(vote)
     return {"msg": "Vote recorded successfully"}
 
-
 @app.get("/results")
 async def get_results():
     results = {}
@@ -217,7 +235,7 @@ async def get_results():
             candidate_results.append({
                 "name": candidate["name"],
                 "votes": vote_count,
-                "image_url": candidate["image_url"]
+                "image_url": candidate.get("image_url")
             })
         results[position_name] = candidate_results
     return results
