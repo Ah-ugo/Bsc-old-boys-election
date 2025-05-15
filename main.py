@@ -272,10 +272,8 @@ async def vote(candidate_id: str, position: str, current_user: dict = Depends(ge
     # Validate candidate_id and position
     if not candidates_collection.find_one({"_id": ObjectId(candidate_id), "position": position}):
         raise HTTPException(status_code=400, detail="Invalid candidate or position")
-
     if votes_collection.find_one({"user_id": str(current_user["_id"]), "position": position}):
         raise HTTPException(status_code=400, detail="Already voted for this position")
-
     vote = {
         "user_id": str(current_user["_id"]),
         "candidate_id": candidate_id,
