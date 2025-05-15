@@ -208,6 +208,42 @@ async def get_candidates():
     ]
 
 
+@app.get("/candidates/{candidate_id}", response_model=Candidate)
+async def get_candidate_by_id(candidate_id: str):
+    if not ObjectId.is_valid(candidate_id):
+        raise HTTPException(status_code=400, detail="Invalid candidate ID format")
+
+    candidate = candidates_collection.find_one({"_id": ObjectId(candidate_id)})
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    return {
+        "_id": str(candidate["_id"]),
+        "name": candidate["name"],
+        "position": candidate["position"],
+        "image_url": candidate.get("image_url")
+    }
+
+
+@app.get("/candidates/position/{position_name}", response_model=List[Candidate])
+async def get_candidates_by_position(position_name: str):
+    # First check if the position exists
+    if not positions_collection.find_one({"name": position_name}):
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    candidates = list(candidates_collection.find({"position": position_name}))
+
+    return [
+        {
+            "_id": str(candidate["_id"]),
+            "name": candidate["name"],
+            "position": candidate["position"],
+            "image_url": candidate.get("image_url")
+        }
+        for candidate in candidates
+    ]
+
+
 @app.delete("/candidates/{candidate_id}")
 async def delete_candidate(candidate_id: str, current_user: dict = Depends(get_current_admin)):
     # Validate candidate_id format
