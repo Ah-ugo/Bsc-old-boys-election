@@ -2,7 +2,7 @@ from bson import ObjectId
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pymongo import MongoClient
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -63,10 +63,14 @@ class UserInDB(User):
 
 
 class Candidate(BaseModel):
-    _id: Optional[str] = None
+    id: Optional[str] = Field(None, alias="_id")  # This will map MongoDB's "_id" to "id"
     name: str
     position: str
     image_url: Optional[str] = None
+
+    class Config:
+        allow_population_by_field_name = True
+        json_encoders = {ObjectId: str}
 
 
 class Vote(BaseModel):
@@ -202,6 +206,29 @@ async def get_candidates():
         }
         for candidate in candidates
     ]
+
+
+@app.delete("/candidates/{candidate_id}")
+async def delete_candidate(candidate_id: str, current_user: dict = Depends(get_current_admin)):
+    # Validate candidate_id format
+    if not ObjectId.is_valid(candidate_id):
+        raise HTTPException(status_code=400, detail="Invalid candidate ID format")
+
+    # Check if candidate exists
+    candidate = candidates_collection.find_one({"_id": ObjectId(candidate_id)})
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # Delete all votes for this candidate
+    votes_collection.delete_many({"candidate_id": candidate_id})
+
+    # Delete the candidate
+    result = candidates_collection.delete_one({"_id": ObjectId(candidate_id)})
+
+    if result.deleted_count == 1:
+        return {"msg": "Candidate deleted successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete candidate")
 
 
 @app.post("/vote")
