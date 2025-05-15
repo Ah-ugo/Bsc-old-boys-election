@@ -1,0 +1,223 @@
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pymongo import MongoClient
+from pydantic import BaseModel
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import List, Optional
+from cloudinary.uploader import upload
+from cloudinary.utils import cloudinary_url
+import cloudinary
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# MongoDB Setup
+client = MongoClient(os.getenv("MONGO_URI"))
+db = client.voting_app
+users_collection = db.users
+candidates_collection = db.candidates
+votes_collection = db.votes
+positions_collection = db.positions
+
+# Cloudinary Setup
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
+
+# JWT Setup
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+# Pydantic Models
+class User(BaseModel):
+    username: str
+    email: str
+    is_admin: bool = False
+
+
+class UserInDB(User):
+    hashed_password: str
+
+
+class Candidate(BaseModel):
+    name: str
+    position: str
+    image_url: Optional[str] = None
+
+
+class Vote(BaseModel):
+    user_id: str
+    candidate_id: str
+    position: str
+
+
+class Position(BaseModel):
+    name: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+# Utility Functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = users_collection.find_one({"username": username})
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+async def get_current_admin(token: str = Depends(oauth2_scheme)):
+    user = await get_current_user(token)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+# Routes
+@app.post("/register")
+async def register(username: str, email: str, password: str, is_admin: bool = False):
+    if users_collection.find_one({"username": username}):
+        raise HTTPException(status_code=400, detail="Username already registered")
+    hashed_password = get_password_hash(password)
+    user = {
+        "username": username,
+        "email": email,
+        "hashed_password": hashed_password,
+        "is_admin": is_admin
+    }
+    users_collection.insert_one(user)
+    return {"msg": "User registered successfully"}
+
+
+@app.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = users_collection.find_one({"username": form_data.username})
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/positions")
+async def create_position(position: Position, current_user: dict = Depends(get_current_admin)):
+    if positions_collection.find_one({"name": position.name}):
+        raise HTTPException(status_code=400, detail="Position already exists")
+    positions_collection.insert_one(position.dict())
+    return {"msg": "Position created successfully"}
+
+
+@app.post("/candidates")
+async def create_candidate(name: str, position: str, image: UploadFile = File(...),
+                           current_user: dict = Depends(get_current_admin)):
+    if not positions_collection.find_one({"name": position}):
+        raise HTTPException(status_code=400, detail="Position does not exist")
+
+    # Upload image to Cloudinary
+    upload_result = upload(image.file)
+    image_url = upload_result["secure_url"]
+
+    candidate = {
+        "name": name,
+        "position": position,
+        "image_url": image_url
+    }
+    candidates_collection.insert_one(candidate)
+    return {"msg": "Candidate created successfully"}
+
+
+@app.get("/positions", response_model=List[Position])
+async def get_positions():
+    positions = list(positions_collection.find({}, {"_id": 0}))
+    return positions
+
+
+@app.get("/candidates", response_model=List[Candidate])
+async def get_candidates():
+    candidates = list(candidates_collection.find({}, {"_id": 0}))
+    return candidates
+
+
+@app.post("/vote")
+async def vote(candidate_id: str, position: str, current_user: dict = Depends(get_current_user)):
+    if not candidates_collection.find_one({"_id": candidate_id, "position": position}):
+        raise HTTPException(status_code=400, detail="Invalid candidate or position")
+
+    if votes_collection.find_one({"user_id": str(current_user["_id"]), "position": position}):
+        raise HTTPException(status_code=400, detail="Already voted for this position")
+
+    vote = {
+        "user_id": str(current_user["_id"]),
+        "candidate_id": candidate_id,
+        "position": position,
+        "timestamp": datetime.utcnow()
+    }
+    votes_collection.insert_one(vote)
+    return {"msg": "Vote recorded successfully"}
+
+
+@app.get("/results")
+async def get_results():
+    results = {}
+    positions = positions_collection.find()
+    for pos in positions:
+        position_name = pos["name"]
+        candidates = candidates_collection.find({"position": position_name})
+        candidate_results = []
+        for candidate in candidates:
+            vote_count = votes_collection.count_documents({"candidate_id": str(candidate["_id"])})
+            candidate_results.append({
+                "name": candidate["name"],
+                "votes": vote_count,
+                "image_url": candidate["image_url"]
+            })
+        results[position_name] = candidate_results
+    return results
